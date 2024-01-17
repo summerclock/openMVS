@@ -32,10 +32,12 @@
 #include "Common.h"
 #include "Scene.h"
 #include "RectsBinPack.h"
+#include "libs/Common/Types.h"
 // connected components
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/filtered_graph.hpp>
 #include <boost/graph/connected_components.hpp>
+#include <opencv2/core/types.hpp>
 
 using namespace MVS;
 
@@ -180,6 +182,7 @@ struct MeshTexture {
 		float quality; // how well the face is seen by this view
 		#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 		Color color; // additionally store mean color (used to remove outliers)
+		int area = 0;
 		#endif
 	};
 	typedef cList<FaceData,const FaceData&,0,8,uint32_t> FaceDataArr; // store information about one face seen from several views
@@ -371,9 +374,57 @@ struct MeshTexture {
 		}
 	};
 
+	struct RasterPatchGetAccEdgeData {
+		Image32F3& image;
+		Image8U& mask;
+		const Image32F3& image0;
+		const Image8U3& image1;
+		const TexCoord p0, p0Dir;
+		const TexCoord p1, p1Dir;
+		const float length;
+		const Sampler sampler;
+		Point3f accumColor0;
+		Point3f accumColor1;
+		int count;
+
+		inline RasterPatchGetAccEdgeData(Image32F3& _image, Image8U& _mask, const Image32F3& _image0, const Image8U3& _image1,
+									   const TexCoord& _p0, const TexCoord& _p0Adj, const TexCoord& _p1, const TexCoord& _p1Adj)
+			: image(_image), mask(_mask), image0(_image0), image1(_image1),
+			p0(_p0), p0Dir(_p0Adj-_p0), p1(_p1), p1Dir(_p1Adj-_p1), length((float)norm(p0Dir)), sampler(), count(0) {}
+		// inline void operator()(const ImageRef& pt) {
+		// 	const float l((float)norm(TexCoord(pt)-p0)/length);
+		// 	// compute mean color
+		// 	const TexCoord samplePos0(p0 + p0Dir * l);
+		// 	AccumColor accumColor(image0.sample<Sampler,Color>(sampler, samplePos0), 1.f);
+		// 	const TexCoord samplePos1(p1 + p1Dir * l);
+		// 	accumColor.Add(image1.sample<Sampler,Color>(sampler, samplePos1)/255.f, 1.f);
+		// 	image(pt) = accumColor.Normalized();
+		// 	// set mask edge also
+		// 	mask(pt) = border;
+		// }
+		
+		inline void operator()(const ImageRef& pt) {
+			const float l((float)norm(TexCoord(pt)-p0)/length);
+			// compute mean color
+			const TexCoord samplePos0(p0 + p0Dir * l);
+			auto color0 = image0.sample<Sampler,Color>(sampler, samplePos0);
+			const TexCoord samplePos1(p1 + p1Dir * l);
+			auto color1 = image1.sample<Sampler,Color>(sampler, samplePos1)/255.f;
+			accumColor0.x += color0.x;
+			accumColor0.y += color0.y;
+			accumColor0.z += color0.z;
+			accumColor1.x += color1.x;
+			accumColor1.y += color1.y;
+			accumColor1.z += color1.z;
+			count++;
+			// set mask edge also
+			mask(pt) = border;
+		}
+	};
+
 
 public:
-	MeshTexture(Scene& _scene, unsigned _nResolutionLevel=0, unsigned _nMinResolution=640);
+	MeshTexture(Scene& _scene, unsigned _nResolutionLevel=0, unsigned _nMinResolution=640, float _colorDissimilarityThreshold = 0.2);
 	~MeshTexture();
 
 	void ListVertexFaces();
@@ -382,6 +433,7 @@ public:
 
 	#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	bool FaceOutlierDetection(FaceDataArr& faceDatas, float fOutlierThreshold) const;
+	bool FaceOutlierDetection_area(FaceDataArr& faceDatas, int area);
 	#endif
 
 	bool FaceViewSelection(float fOutlierThreshold, float fRatioDataSmoothness);
@@ -443,9 +495,11 @@ public:
 	ImageArr& images;
 
 	Scene& scene; // the mesh vertices and faces
+
+	float colorDissimilarityThreshold; // threshold to decide if two colors are similar or not
 };
 
-MeshTexture::MeshTexture(Scene& _scene, unsigned _nResolutionLevel, unsigned _nMinResolution)
+MeshTexture::MeshTexture(Scene& _scene, unsigned _nResolutionLevel, unsigned _nMinResolution, float _colorDissimilarityThreshold)
 	:
 	nResolutionLevel(_nResolutionLevel),
 	nMinResolution(_nMinResolution),
@@ -456,7 +510,8 @@ MeshTexture::MeshTexture(Scene& _scene, unsigned _nResolutionLevel, unsigned _nM
 	vertices(_scene.mesh.vertices),
 	faces(_scene.mesh.faces),
 	images(_scene.images),
-	scene(_scene)
+	scene(_scene),
+	colorDissimilarityThreshold(_colorDissimilarityThreshold)
 {
 }
 MeshTexture::~MeshTexture()
@@ -624,6 +679,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			if (area > 0) {
 				Color& color = facesDatas[idxFace].Last().color;
 				color = RGB2YCBCR(Color(color * (1.f/(float)area)));
+				facesDatas[idxFace].Last().area = area;
 			}
 		}
 		#endif
@@ -635,6 +691,26 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		return false;
 	#endif
 	progress.close();
+
+	if (1) {
+		// try to detect outlier views for each face
+		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
+		FOREACHPTR(pFaceDatas, facesDatas)
+		{
+			if (pFaceDatas->size() < 20){
+				continue;
+			}
+			std::vector<int> areas_;
+			areas_.clear();
+			for (int i = 0; i < pFaceDatas->size(); i++) {
+				areas_.push_back((*pFaceDatas)[i].area);
+			}
+			sort(areas_.begin(),areas_.end());
+			int ini_= areas_.size()*0.7;
+			FaceOutlierDetection_area(*pFaceDatas, areas_[ini_]);
+		}
+	}
+
 
 	#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	if (fOutlierThreshold > 0) {
@@ -721,6 +797,24 @@ inline T MultiGaussUnnormalized(const Eigen::Matrix<T,N,1>& X, const Eigen::Matr
 	return MultiGaussUnnormalized<T,N>(X - mu, covarianceInv);
 }
 
+bool MeshTexture::FaceOutlierDetection_area(FaceDataArr& faceDatas, int area){
+	BoolArr inliers(faceDatas.GetSize());
+	for (int i = 0; i < faceDatas.size();i++) {
+		if (faceDatas[i].area > area) {
+			inliers[i] = 1;
+		}
+		else
+		{
+			inliers[i] = 0;
+		}
+	}
+	RFOREACH(i, faceDatas)
+		if (!inliers[i])
+			faceDatas.RemoveAt(i);
+	return 1;
+
+}
+
 // decrease the quality of / remove all views in which the face's projection
 // has a much different color than in the majority of views
 bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) const
@@ -729,7 +823,7 @@ bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) 
 	if (thOutlier <= 0)
 		thOutlier = 6e-2f;
 
-	const float minCovariance(1e-3f); // if all covariances drop below this the outlier detection aborted
+	const float minCovariance(1e-3f); // if all covariances(协方差) drop below this the outlier detection aborted
 
 	const unsigned maxIterations(10);
 	const unsigned minInliers(4);
@@ -829,7 +923,7 @@ bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmo
 {
 	// extract array of triangles incident to each vertex
 	ListVertexFaces();
-
+	
 	// create texture patches
 	{
 		// list all views for each face
@@ -850,7 +944,7 @@ bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmo
 			Mesh::FaceIdxArr afaces;
 			FOREACH(idxFace, faces) {
 				scene.mesh.GetFaceFaces(idxFace, afaces);
-				ASSERT(ISINSIDE((int)afaces.GetSize(), 1, 4));
+				ASSERT(ISINSIDE((int)afaces.GetSize(), 0, 4));//默认值（1,4）
 				FOREACHPTR(pIdxFace, afaces) {
 					const FIndex idxFaceAdj = *pIdxFace;
 					if (idxFace >= idxFaceAdj)
@@ -1082,10 +1176,13 @@ bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmo
 				const Label label(labels[f]);
 				const FIndex c(components[f]);
 				TexturePatch& texturePatch = texturePatches[c];
+				
 				ASSERT(texturePatch.label == label || texturePatch.faces.IsEmpty());
 				if (label == NO_ID) {
-					texturePatch.label = NO_ID;
-					texturePatches.Last().faces.Insert(f);
+					texturePatch.label = NO_ID;//修改NO_ID为labels[f-1]
+					texturePatches.Last().faces.Insert(f);//将不可见faces不包含进last testure patch
+					
+					
 				} else {
 					if (texturePatch.faces.IsEmpty()) {
 						texturePatch.label = label;
@@ -1100,8 +1197,9 @@ bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmo
 			std::iota(mapIdxPatch.Begin(), mapIdxPatch.End(), 0);
 			for (FIndex t = nComponents; t-- > 0; ) {
 				if (texturePatches[t].label == NO_ID) {
-					texturePatches.RemoveAtMove(t);
+					texturePatches.RemoveAtMove(t); 
 					mapIdxPatch.RemoveAtMove(t);
+					
 				}
 			}
 			const unsigned numPatches(texturePatches.GetSize()-1);
@@ -1360,11 +1458,21 @@ void MeshTexture::GlobalSeamLeveling()
 			const FIndex idxFace(*pIdxFace);
 			const Face& face = faces[idxFace];
 			data.tri = faceTexcoords.Begin()+idxFace*3;
-			for (int v=0; v<3; ++v)
-				data.colors[v] = colorAdjustments.row(vertpatch2rows[face[v]].at(idxPatch));
-			// render triangle and for each pixel interpolate the color adjustment
-			// from the triangle corners using barycentric coordinates
-			ColorMap::RasterizeTriangle(data.tri[0], data.tri[1], data.tri[2], data);
+			for (int v = 0; v < 3; ++v)
+			{
+
+				//data.colors[v] = colorAdjustments.row(vertpatch2rows[face[v]].at(idxPatch));
+				//// render triangle and for each pixel interpolate the color adjustment
+				//// from the triangle corners using barycentric coordinates
+				//ColorMap::RasterizeTriangle(data.tri[0], data.tri[1], data.tri[2], data);
+				
+				uint32_t itern = face[v];
+				VertexPatch2RowMap itern_face = vertpatch2rows[itern];
+				int itern_face_vert = itern_face[idxPatch];
+				data.colors[v] = colorAdjustments.row(itern_face_vert);
+				ColorMap::RasterizeTriangle(data.tri[0], data.tri[1], data.tri[2], data);
+			}
+			
 		}
 		// dilate with one pixel width, in order to make sure patch border smooths out a little
 		imageAdj.DilateMean<1>(imageAdj, Color::ZERO);
@@ -1378,14 +1486,18 @@ void MeshTexture::GlobalSeamLeveling()
 				Pixel8U& v = image.at<Pixel8U>(r,c);
 				const Color col(RGB2YCBCR(Color(v)));
 				const Color acol(YCBCR2RGB(Color(col+a)));
+
 				for (int p=0; p<3; ++p)
-					v[p] = (uint8_t)CLAMP(ROUND2INT(acol[p]), 0, 255);
+					v[p] = ((uint8_t)CLAMP(ROUND2INT(0.3*acol[p]+0.7*v[p]), 0, 255));//颜色微调
+
+				//for (int p=0; p<3; ++p)
+				//	v[p] = ((uint8_t)CLAMP(ROUND2INT(acol[p]), 0, 255));//取消颜色调整
 			}
 		}
 	}
 }
 
-// set to one in order to dilate also on the diagonal of the border
+// set to one in order to dilate also on the diagonal(对角线)of the border
 // (normally not needed)
 #define DILATE_EXTRA 0
 void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
@@ -1668,10 +1780,49 @@ void MeshTexture::PoissonBlending(const Image32F3& src, Image32F3& dst, const Im
 	}
 }
 
+template <typename PIXEL>
+static inline PIXEL RGB2YCBCR_NORM(const PIXEL& v) {
+    typedef typename PIXEL::Type T;
+    return PIXEL(
+        v[0] * T(0.299) + v[1] * T(0.587) + v[2] * T(0.114),
+        v[0] * T(-0.168736) + v[1] * T(-0.331264) + v[2] * T(0.5) + T(0.5),
+        v[0] * T(0.5) + v[1] * T(-0.418688) + v[2] * T(-0.081312) + T(0.5)
+    );
+}
+
+// double calcColorDissimilarity(const Point3f& color1, const Point3f& color2)
+// {
+// 	auto color1_YCBCR = RGB2YCBCR_NORM(color1);
+// 	auto color2_YCBCR = RGB2YCBCR_NORM(color2);
+//     double diffY = color1_YCBCR.x - color2_YCBCR.x;
+//     double diffCb = color1_YCBCR.y - color2_YCBCR.y;
+//     double diffCr = color1_YCBCR.z - color2_YCBCR.z;
+
+//     double diffSquared = 0.2 * diffY * diffY + 1.4 * diffCb * diffCb + 1.4 * diffCr * diffCr;
+
+//     double colorDissimilarity = std::sqrt(diffSquared) / std::sqrt(3.0);
+
+//     return colorDissimilarity;
+// }
+
+double calcColorDissimilarity(const Point3f& color1, const Point3f& color2)
+{
+    double diffR = color1.x - color2.x;
+    double diffG = color1.y - color2.y;
+    double diffB = color1.z - color2.z;
+
+    double diffSquared = diffR * diffR + diffG * diffG + diffB * diffB;
+
+    double colorDissimilarity = std::sqrt(diffSquared) / std::sqrt(3.0);
+
+    return colorDissimilarity;
+}
+
 void MeshTexture::LocalSeamLeveling()
 {
 	ASSERT(!seamVertices.IsEmpty());
 	const unsigned numPatches(texturePatches.GetSize()-1);
+	std::cout << "colorDissimilarityThreshold: " << this->colorDissimilarityThreshold << std::endl;
 
 	// adjust texture patches locally, so that the border continues smoothly inside the patch
 	#ifdef TEXOPT_USE_OPENMP
@@ -1734,6 +1885,14 @@ void MeshTexture::LocalSeamLeveling()
 					// this is an edge separating two (valid) patches;
 					// draw it on this patch as the mean color of the two patches
 					const Image8U3& image1(images[texturePatches[patch1.idxPatch].label].image);
+					RasterPatchGetAccEdgeData validator(image, mask, imageOrg, image1, p0, p0Adj, p1, p1Adj);
+					Image32F3::DrawLine(p0, p0Adj, validator);
+					
+					auto colorDissimilarity = calcColorDissimilarity(validator.accumColor0 / validator.count, validator.accumColor1 / validator.count);
+					if (colorDissimilarity > this->colorDissimilarityThreshold) {
+						break;
+					}
+					
 					RasterPatchMeanEdgeData data(image, mask, imageOrg, image1, p0, p0Adj, p1, p1Adj);
 					Image32F3::DrawLine(p0, p0Adj, data);
 					// skip remaining patches,
@@ -1778,7 +1937,7 @@ void MeshTexture::LocalSeamLeveling()
 				const Color& a = image(r,c);
 				Pixel8U& v = imagePatch.at<Pixel8U>(r,c);
 				for (int p=0; p<3; ++p)
-					v[p] = (uint8_t)CLAMP(ROUND2INT(a[p]*255.f), 0, 255);
+					v[p] = (uint8_t)CLAMP(ROUND2INT(a[p]*255.f), 0, 255);//颜色调整
 			}
 		}
 	}
@@ -1831,13 +1990,13 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 	{
 		// init last patch to point to a small uniform color patch
 		TexturePatch& texturePatch = texturePatches.Last();
-		const int sizePatch(border*2+1);
+		const int sizePatch(border*2+1);//将*2改成其他1
 		texturePatch.rect = cv::Rect(0,0, sizePatch,sizePatch);
 		FOREACHPTR(pIdxFace, texturePatch.faces) {
 			const FIndex idxFace(*pIdxFace);
 			TexCoord* texcoords = faceTexcoords.Begin()+idxFace*3;
 			for (int i=0; i<3; ++i)
-				texcoords[i] = TexCoord(0.5f, 0.5f);
+				texcoords[i] = TexCoord(0.5f, 0.5f);//将0.5,0.5改成其他数字
 		}
 	}
 
@@ -1893,7 +2052,8 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		RectsBinPack::RectArr rects(texturePatches.GetSize());
 		FOREACH(i, texturePatches)
 			rects[i] = texturePatches[i].rect;
-		int textureSize(RectsBinPack::ComputeTextureSize(rects, nTextureSizeMultiple));
+		//int textureSize(RectsBinPack::ComputeTextureSize(rects, nTextureSizeMultiple));
+		int textureSize=1024;
 		// increase texture size till all patches fit
 		while (true) {
 			TD_TIMER_STARTD();
@@ -1920,13 +2080,14 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			DEBUG_ULTIMATE("\tpacking texture completed: %u patches, %u texture-size (%s)", rects.GetSize(), textureSize, TD_TIMER_GET_FMT().c_str());
 			if (bPacked)
 				break;
-			textureSize *= 2;
+			textureSize += 500;
 		}
 
 		// create texture image
 		const float invNorm(1.f/(float)(textureSize-1));
 		textureDiffuse.create(textureSize, textureSize);
-		textureDiffuse.setTo(cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
+		textureDiffuse.setTo(cv::Scalar(128, 128, 128));//colEmpty.b, colEmpty.g, colEmpty.r改背景色
+		Mesh::FaceIdxArr facearr; //存储空洞faces的idx
 		#ifdef TEXOPT_USE_OPENMP
 		#pragma omp parallel for schedule(dynamic)
 		for (int_t i=0; i<(int_t)texturePatches.GetSize(); ++i) {
@@ -1940,38 +2101,198 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			ASSERT((rect.width == texturePatch.rect.width && rect.height == texturePatch.rect.height) ||
 				   (rect.height == texturePatch.rect.width && rect.width == texturePatch.rect.height));
 			int x(0), y(1);
-			if (texturePatch.label != NO_ID) {
+			if (texturePatch.label != NO_ID) {             
 				const Image& imageData = images[texturePatch.label];
 				cv::Mat patch(imageData.image(texturePatch.rect));
+
+				/*cv::Mat gauss;
+				cv::GaussianBlur(patch, gauss,cv::Size(7, 7), 0, 0);
+				patch = 4 * patch - 3 * gauss;*/
+
 				if (rect.width != texturePatch.rect.width) {
 					// flip patch and texture-coordinates
 					patch = patch.t();
 					x = 1; y = 0;
 				}
-				patch.copyTo(textureDiffuse(rect));
-			}
-			// compute final texture coordinates
-			const TexCoord offset(rect.tl());
+				//cv::resize(patch, patch,cv::Size(), 2, 2);
+				patch.copyTo(textureDiffuse(rect));//生成贴图的纹理图片集		
+			}				
+			// compute final texture coordinates 
+			const TexCoord offset(rect.tl());	
 			FOREACHPTR(pIdxFace, texturePatch.faces) {
 				const FIndex idxFace(*pIdxFace);
 				TexCoord* texcoords = faceTexcoords.Begin()+idxFace*3;
-				for (int v=0; v<3; ++v) {
+				if (texturePatch.label == NO_ID)//增加if判断
+				{		
+					facearr.Insert(idxFace);//添加空洞faces的idx					
+				}
+				for (int v = 0; v < 3; ++v) {
 					TexCoord& texcoord = texcoords[v];
 					// translate, normalize and flip Y axis
 					texcoord = TexCoord(
-						(texcoord[x]+offset.x)*invNorm,
-						1.f-(texcoord[y]+offset.y)*invNorm
+						(texcoord[x] + offset.x)*invNorm,
+						1.f - (texcoord[y] + offset.y)*invNorm
 					);
+				}				
+			}
+
+		}
+		
+		//计算空洞（不可见）faces的纹理坐标
+		Mesh::FaceIdxArr facearr_no; //存储未纹理faces的idx
+		FOREACH(idxFace, facearr)
+		{
+			int j = facearr[idxFace];
+			Face a = scene.mesh.faces[j];
+			Mesh::FaceArr facesize = scene.mesh.faces;
+			Mesh::FaceIdxArr facearr2;
+			facearr2.Insert(j);
+			int label_texture = 0;
+			FOREACH(idxFace2, facesize)
+			{
+				Mesh::Face b = scene.mesh.faces[idxFace2];
+				//int i2 = idxFace2;
+				if ((a.x == b.x && (a.y == b.y || a.y == b.z || a.z == b.y || a.z == b.z))
+					|| (a.x == b.y && (a.y == b.x || a.y == b.z || a.z == b.x || a.z == b.z))
+					|| (a.x == b.z && (a.y == b.x || a.y == b.y || a.z == b.x || a.z == b.y))
+					|| (a.y == b.x && (a.z == b.y || a.z == b.z)) || (a.y == b.y && (a.z == b.x || a.z == b.z)) || (a.y == b.z && (a.z == b.x || a.z == b.y)))//寻找相邻face
+				{
+					int label2 = 1;
+					if (a.x == b.x&&a.y == b.y&&a.z == b.z)//找到的点不能是本身
+					{
+						continue;
+					}
+					else
+					{
+						FOREACH(idxFace4, facearr2)//遍历前面所有找到的空的faces，不能是其中的
+						{
+							int r2 = facearr2[idxFace4];
+							if (r2 == idxFace2)
+							{
+								label2 = 0;
+								break;
+							}
+						}
+						if (label2 == 1)
+						{
+							int label = 1;
+							FOREACH(idxFace3, facearr)
+							{
+								int r = facearr[idxFace3];
+								if (idxFace2 == r)//判断相邻的face是否为空洞
+								{
+									a = b;
+									label = 0;
+									idxFace2 = 0;//循环
+									facearr2.Insert(r);
+									break;
+								}
+							}
+							if (label == 1)
+							{
+								TexCoord* texcoords = faceTexcoords.Begin() + j * 3;//计算纹理坐标
+								TexCoord* texcoords2 = faceTexcoords.Begin() + idxFace2 * 3;
+								for (int v = 0; v < 3; ++v)
+								{
+									TexCoord& texcoord2 = texcoords2[v];
+									TexCoord& texcoord = texcoords[v];
+
+									//texcoord.x = texcoords2->x;
+									//texcoord.y = texcoords2->y;
+									texcoord = TexCoord(texcoord2.x, texcoord2.y);
+								}
+								label_texture = 1;
+								break;
+							}
+						}
+					}
 				}
 			}
+			if (label_texture == 0)
+			{
+				facearr_no.Insert(j);
+			}
 		}
+
+		//FOREACH(idxFace, facearr_no)//打印faces
+		//{
+		//	TD_TIMER_STARTD();
+		//	int i= facearr_no[idxFace];
+		//	DEBUG_EXTRA("no texture faces: %u faces ", i, TD_TIMER_GET_FMT().c_str());
+		//}
+		//FOREACH(idxFace, facearr_no)//再次纹理没有纹理的faces
+		//{
+		//	int i = facearr_no[idxFace];
+		//	Face a = scene.mesh.faces[i];
+		//	Mesh::FaceIdxArr facearr2;
+		//	facearr2.Insert(i);
+		//	FOREACH(idxFace2, scene.mesh.faces)
+		//	{
+		//		Mesh::Face b = scene.mesh.faces[idxFace2];
+		//		if ((a.x == b.x && (a.y == b.y || a.y == b.z || a.z == b.y || a.z == b.z))
+		//			|| (a.x == b.y && (a.y == b.x || a.y == b.z || a.z == b.x || a.z == b.z))
+		//			|| (a.x == b.z && (a.y == b.x || a.y == b.y || a.z == b.x || a.z == b.y)) 
+		//			|| (a.y == b.x && (a.z == b.y || a.z == b.z)) || (a.y == b.y && (a.z == b.x || a.z == b.z)) || (a.y == b.z && (a.z == b.x || a.z == b.y)))//寻找相邻face
+		//		{
+		//			int label2 = 1;
+		//			if (a.x == b.x&&a.y == b.y&&a.z == b.z)//找到的点不能是本身
+		//			{
+		//				continue;
+		//			}
+		//			else
+		//			{
+		//				FOREACH(idxFace4, facearr2)//遍历前面所有找到的空的faces，不能是其中的
+		//				{
+		//					int r2 = facearr2[idxFace4];
+		//					if (r2 == idxFace2)
+		//					{
+		//						label2 = 0;
+		//						break;
+		//					}
+		//				}
+		//				if (label2 == 1)
+		//				{
+		//					int label = 1;
+		//					FOREACH(idxFace3, facearr_no)
+		//					{
+		//						int r = facearr[idxFace3];
+		//						if (idxFace2 == r)//判断相邻的face是否也没有纹理
+		//						{
+		//							a = b;
+		//							label = 0;
+		//							idxFace2 = 0;//循环
+		//							facearr2.Insert(r);
+		//							break;
+		//						}
+		//					}
+		//					if (label == 1)
+		//					{
+		//						TexCoord* texcoords = faceTexcoords.Begin() + i * 3;//计算纹理坐标
+		//						//TexCoord* texcoords2 = faceTexcoords.Begin() + idxFace2 * 3;
+		//						//TexCoord* texcoords2=faceTexcoords[idxFace2]
+		//						for (int v = 0; v < 3; ++v)
+		//						{
+		//							//TexCoord& texcoord2 = texcoords2[v];
+		//							TexCoord& texcoord = texcoords[v];
+		//							//texcoord.x = texcoords2->x;
+		//							//texcoord.y = texcoords2->y;
+		//							//texcoord = TexCoord(texcoord2[x], texcoord2[y]);
+		//							texcoord.x = faceTexcoords[idxFace2].x;
+		//							texcoord.y = faceTexcoords[idxFace2].y;
+		//						}
+		//					}
+		//				}
+		//			}
+		//		}
+		//	}
+		//}
 	}
 }
 
 // texture mesh
-bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, float fOutlierThreshold, float fRatioDataSmoothness, bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty)
+bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, float fOutlierThreshold, float fRatioDataSmoothness, bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float colorDissimilarityThreshold)
 {
-	MeshTexture texture(*this, nResolutionLevel, nMinResolution);
+	MeshTexture texture(*this, nResolutionLevel, nMinResolution, colorDissimilarityThreshold);
 
 	// assign the best view to each face
 	{
