@@ -98,7 +98,8 @@ def find(afile):
 
 # Try to find openMVG and openMVS binaries in PATH
 OPENMVG_BIN = whereis("openMVG_main_SfMInit_ImageListing")
-OPENMVS_BIN = whereis("ReconstructMesh")
+# OPENMVS_BIN = whereis("ReconstructMesh")
+OPENMVS_BIN = "/workspaces/reconstruction_workspace/openMVS/my_build/bin/"
 
 # Try to find openMVG camera sensor database
 CAMERA_SENSOR_DB_FILE = "sensor_width_camera_database.txt"
@@ -210,16 +211,16 @@ class StepsStore:
              ["-i", "%reconstruction_dir%/sfm_data.bin", "-o", "%mvs_dir%/scene.mvs", "-d", "%mvs_dir%/images"]],
             ["Densify point cloud",          # 10
              os.path.join(OPENMVS_BIN, "DensifyPointCloud"),
-             ["scene.mvs", "--dense-config-file", "Densify.ini", "--resolution-level", "1", "-w", "%mvs_dir%"]],
+             ["scene.mvs", "--dense-config-file", "Densify.ini", "--resolution-level", "4", "-w", "%mvs_dir%"]],
             ["Reconstruct the mesh",         # 11
              os.path.join(OPENMVS_BIN, "ReconstructMesh"),
-             ["scene_dense.mvs", "-w", "%mvs_dir%"]],
+             ["scene_dense.mvs","--decimate", "0.5","-d","8","-w", "%mvs_dir%"]],
             ["Refine the mesh",              # 12
              os.path.join(OPENMVS_BIN, "RefineMesh"),
-             ["scene_dense_mesh.mvs", "--scales", "2", "-w", "%mvs_dir%"]],
+             ["scene_dense_mesh.mvs", "--scales", "1", "-w", "%mvs_dir%"]],
             ["Texture the mesh",             # 13
              os.path.join(OPENMVS_BIN, "TextureMesh"),
-             ["scene_dense_mesh_refine.mvs", "--decimate", "0.5", "-w", "%mvs_dir%"]],
+             ["scene_dense_mesh.mvs", "--decimate", "0.5", "-w", "%mvs_dir%"]],
             ["Estimate disparity-maps",      # 14
              os.path.join(OPENMVS_BIN, "DensifyPointCloud"),
              ["scene.mvs", "--dense-config-file", "Densify.ini", "--fusion-mode", "-1", "-w", "%mvs_dir%"]],
@@ -227,7 +228,7 @@ class StepsStore:
              os.path.join(OPENMVS_BIN, "DensifyPointCloud"),
              ["scene.mvs", "--dense-config-file", "Densify.ini", "--fusion-mode", "-2", "-w", "%mvs_dir%"]]
             ]
-
+        
     def __getitem__(self, indice):
         return AStep(*self.steps_data[indice])
 

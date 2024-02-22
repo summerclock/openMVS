@@ -33,11 +33,14 @@
 #include "Scene.h"
 #include "RectsBinPack.h"
 #include "libs/Common/Types.h"
+#include "libs/MVS/Image.h"
 // connected components
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/filtered_graph.hpp>
 #include <boost/graph/connected_components.hpp>
+#include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
+#include <opencv2/imgproc.hpp>
 
 using namespace MVS;
 
@@ -146,6 +149,42 @@ enum Mask {
 	interior = 255
 };
 
+// def entropy(img):
+//     if len(img.shape) == 3:
+//         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+//     hist = cv2.calcHist([img],[0],None,[256],[0,256])
+//     hist = hist / img.size
+//     hist = hist + 1e-4
+//     logP = np.log(hist)
+//     entropy = -1 * np.sum(hist * logP)
+//     return entropy
+
+float entropy_hist(const std::vector<float>& hist, int count) {
+	cv::Mat hist_mat = cv::Mat(hist, false);
+	hist_mat = hist_mat / count + 1e-4;
+	cv::Mat log_p;
+	cv::log(hist_mat, log_p);
+	float entropy = -cv::sum(hist_mat.mul(log_p))[0];
+	return entropy;
+}
+
+float entropy(const Image8U& img) {
+	cv::Mat hist;
+	int hist_size = 256;
+	float range[] = { 0, 256 };
+	const float* hist_ranges[] = { range };
+	cv::calcHist(&img, 1, 0, cv::Mat(), hist, 1, &hist_size, hist_ranges, true, false);
+	hist /= img.total();
+	hist += 1e-4f;
+	cv::log(hist, hist);
+	return -cv::sum(hist)[0];
+}
+
+template<typename TYPE1, typename TYPE2 = TYPE1>
+inline TYPE2 ComputeAngle(const TYPE1* V1, const TYPE1* V2) {
+	return CLAMP(TYPE2((V1[0]*V2[0]+V1[1]*V2[1]+V1[2]*V2[2])/SQRT((V1[0]*V1[0]+V1[1]*V1[1]+V1[2]*V1[2])*(V2[0]*V2[0]+V2[1]*V2[1]+V2[2]*V2[2]))), TYPE2(-1), TYPE2(1));
+} // ComputeAngle
+
 struct MeshTexture {
 	// used to render the surface to a view camera
 	typedef TImage<cuint32_t> FaceMap;
@@ -180,12 +219,15 @@ struct MeshTexture {
 	struct FaceData {
 		VIndex idxView;// the view seeing this face
 		float quality; // how well the face is seen by this view
+		std::vector<float> hist = std::vector<float>(256, 0); // histogram of the face (used to remove outliers
+		int count = 0;
+		float entropy;
 		#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 		Color color; // additionally store mean color (used to remove outliers)
 		int area = 0;
 		#endif
 	};
-	typedef cList<FaceData,const FaceData&,0,8,uint32_t> FaceDataArr; // store information about one face seen from several views
+	typedef cList<FaceData,const FaceData&,2,8,uint32_t> FaceDataArr; // store information about one face seen from several views
 	typedef cList<FaceDataArr,const FaceDataArr&,2,1024,FIndex> FaceDataViewArr; // store data for all the faces of the mesh
 
 	// used to assign a view to a face
@@ -558,16 +600,20 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	Octree::LogDebugInfo(info);
 	#endif
 
+	// compute face normals
+	scene.mesh.ComputeNormalFaces();
+
 	// extract array of faces viewed by each image
 	Util::Progress progress(_T("Initialized views"), images.GetSize());
 	typedef float real;
 	TImage<real> imageGradMag;
+	TImage<real> imageGray;
 	TImage<real>::EMat mGrad[2];
 	FaceMap faceMap;
 	DepthMap depthMap;
 	#ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
-	#pragma omp parallel for private(imageGradMag, mGrad, faceMap, depthMap)
+	#pragma omp parallel for private(imageGradMag, imageGray, mGrad, faceMap, depthMap)
 	for (int_t idx=0; idx<(int_t)images.GetSize(); ++idx) {
 		#pragma omp flush (bAbort)
 		if (bAbort) {
@@ -597,6 +643,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		}
 		imageData.UpdateCamera(scene.platforms);
 		// compute gradient magnitude
+		imageData.image.toGray(imageGray, cv::COLOR_BGR2GRAY, false);
 		imageData.image.toGray(imageGradMag, cv::COLOR_BGR2GRAY, true);
 		cv::Mat grad[2];
 		mGrad[0].resize(imageGradMag.rows, imageGradMag.cols);
@@ -616,6 +663,8 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
 		#endif
 		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2()+mGrad[1].cwiseAbs2()).cwiseSqrt();
+		// cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(5, 5), 0, 0, cv::BORDER_DEFAULT);
+		(TImage<real>::EMatMap)imageGray = imageGray;
 		// select faces inside view frustum
 		CameraFaces cameraFaces;
 		FacesInserter inserter(vertexFaces, cameraFaces);
@@ -658,6 +707,9 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 					FaceData& faceData = faceDatas.AddEmpty();
 					faceData.idxView = idxView;
 					faceData.quality = imageGradMag(j,i);
+					faceData.hist.resize(256);
+					// update histogram
+					faceData.hist.at(imageGray(j, i)) += 1;
 					#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 					faceData.color = imageData.image(j,i);
 					#endif
@@ -667,19 +719,41 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 					FaceData& faceData = faceDatas.Last();
 					ASSERT(faceData.idxView == idxView);
 					faceData.quality += imageGradMag(j,i);
+					// update histogram
+					faceData.hist.at(imageGray(j, i)) += 1;
+					faceData.count++;
 					#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 					faceData.color += Color(imageData.image(j,i));
 					#endif
 				}
 			}
 		}
+
+		// FOREACH(idxFace, facesDatas) {
+		// 	FaceDataArr& faceDatas = facesDatas[idxFace];
+		// 	if (faceDatas.empty() || faceDatas.back().idxView != idxView)
+		// 		continue;
+		// 	const Face& f = faces[idxFace];
+		// 	const Vertex faceCenter((vertices[f[0]] + vertices[f[1]] + vertices[f[2]]) / 3.f);
+		// 	const Point3f camDir(Cast<Mesh::Type>(imageData.camera.C) - faceCenter);
+		// 	const Normal& faceNormal = scene.mesh.faceNormals[idxFace];
+		// 	const float cosFaceCam(MAXF(0.001f, ComputeAngle(camDir.ptr(), faceNormal.ptr())));
+		// 	faceDatas.back().quality *= SQUARE(cosFaceCam);
+		// }
+
 		#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+		// std::cout << "Perform entropy weighting" << std::endl;
 		FOREACH(idxFace, areas) {
 			const uint32_t& area = areas[idxFace];
 			if (area > 0) {
 				Color& color = facesDatas[idxFace].Last().color;
 				color = RGB2YCBCR(Color(color * (1.f/(float)area)));
 				facesDatas[idxFace].Last().area = area;
+				float entropy = entropy_hist(facesDatas[idxFace].Last().hist, facesDatas[idxFace].Last().count);
+				std::vector<float>().swap(facesDatas[idxFace].Last().hist);
+				// facesDatas[idxFace].Last().quality *= entropy;
+				// facesDatas[idxFace].Last().quality *= area;
+				facesDatas[idxFace].Last().entropy = entropy;
 			}
 		}
 		#endif
@@ -704,6 +778,8 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			areas_.clear();
 			for (int i = 0; i < pFaceDatas->size(); i++) {
 				areas_.push_back((*pFaceDatas)[i].area);
+				// areas_.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
+				
 			}
 			sort(areas_.begin(),areas_.end());
 			int ini_= areas_.size()*0.7;
@@ -801,6 +877,7 @@ bool MeshTexture::FaceOutlierDetection_area(FaceDataArr& faceDatas, int area){
 	BoolArr inliers(faceDatas.GetSize());
 	for (int i = 0; i < faceDatas.size();i++) {
 		if (faceDatas[i].area > area) {
+		// if (faceDatas[i].entropy * faceDatas[i].area > area) {
 			inliers[i] = 1;
 		}
 		else
