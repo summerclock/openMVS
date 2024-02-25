@@ -33,14 +33,11 @@
 #include "Scene.h"
 #include "RectsBinPack.h"
 #include "libs/Common/Types.h"
-#include "libs/MVS/Image.h"
 // connected components
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/filtered_graph.hpp>
 #include <boost/graph/connected_components.hpp>
-#include <opencv2/core/mat.hpp>
 #include <opencv2/core/types.hpp>
-#include <opencv2/imgproc.hpp>
 
 using namespace MVS;
 
@@ -149,16 +146,6 @@ enum Mask {
 	interior = 255
 };
 
-// def entropy(img):
-//     if len(img.shape) == 3:
-//         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-//     hist = cv2.calcHist([img],[0],None,[256],[0,256])
-//     hist = hist / img.size
-//     hist = hist + 1e-4
-//     logP = np.log(hist)
-//     entropy = -1 * np.sum(hist * logP)
-//     return entropy
-
 float entropy_hist(const std::vector<float>& hist, int count) {
 	cv::Mat hist_mat = cv::Mat(hist, false);
 	hist_mat = hist_mat / count + 1e-4;
@@ -168,22 +155,12 @@ float entropy_hist(const std::vector<float>& hist, int count) {
 	return entropy;
 }
 
-float entropy(const Image8U& img) {
-	cv::Mat hist;
-	int hist_size = 256;
-	float range[] = { 0, 256 };
-	const float* hist_ranges[] = { range };
-	cv::calcHist(&img, 1, 0, cv::Mat(), hist, 1, &hist_size, hist_ranges, true, false);
-	hist /= img.total();
-	hist += 1e-4f;
-	cv::log(hist, hist);
-	return -cv::sum(hist)[0];
-}
-
 template<typename TYPE1, typename TYPE2 = TYPE1>
 inline TYPE2 ComputeAngle(const TYPE1* V1, const TYPE1* V2) {
 	return CLAMP(TYPE2((V1[0]*V2[0]+V1[1]*V2[1]+V1[2]*V2[2])/SQRT((V1[0]*V1[0]+V1[1]*V1[1]+V1[2]*V1[2])*(V2[0]*V2[0]+V2[1]*V2[1]+V2[2]*V2[2]))), TYPE2(-1), TYPE2(1));
 } // ComputeAngle
+
+
 
 struct MeshTexture {
 	// used to render the surface to a view camera
@@ -475,7 +452,7 @@ public:
 
 	#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	bool FaceOutlierDetection(FaceDataArr& faceDatas, float fOutlierThreshold) const;
-	bool FaceOutlierDetection_area(FaceDataArr& faceDatas, int area);
+	bool FaceOutlierDetection_area_entropy(FaceDataArr& faceDatas, float t);
 	#endif
 
 	bool FaceViewSelection(float fOutlierThreshold, float fRatioDataSmoothness);
@@ -600,7 +577,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	Octree::LogDebugInfo(info);
 	#endif
 
-	// compute face normals
+	// compute normals
 	scene.mesh.ComputeNormalFaces();
 
 	// extract array of faces viewed by each image
@@ -613,7 +590,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	DepthMap depthMap;
 	#ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
-	#pragma omp parallel for private(imageGradMag, imageGray, mGrad, faceMap, depthMap)
+	#pragma omp parallel for private(imageGradMag,  imageGray, mGrad, faceMap, depthMap)
 	for (int_t idx=0; idx<(int_t)images.GetSize(); ++idx) {
 		#pragma omp flush (bAbort)
 		if (bAbort) {
@@ -663,7 +640,6 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
 		#endif
 		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2()+mGrad[1].cwiseAbs2()).cwiseSqrt();
-		// cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(5, 5), 0, 0, cv::BORDER_DEFAULT);
 		(TImage<real>::EMatMap)imageGray = imageGray;
 		// select faces inside view frustum
 		CameraFaces cameraFaces;
@@ -710,6 +686,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 					faceData.hist.resize(256);
 					// update histogram
 					faceData.hist.at(imageGray(j, i)) += 1;
+					faceData.count = 1;
 					#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 					faceData.color = imageData.image(j,i);
 					#endif
@@ -719,7 +696,6 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 					FaceData& faceData = faceDatas.Last();
 					ASSERT(faceData.idxView == idxView);
 					faceData.quality += imageGradMag(j,i);
-					// update histogram
 					faceData.hist.at(imageGray(j, i)) += 1;
 					faceData.count++;
 					#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
@@ -728,7 +704,6 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 				}
 			}
 		}
-
 		// FOREACH(idxFace, facesDatas) {
 		// 	FaceDataArr& faceDatas = facesDatas[idxFace];
 		// 	if (faceDatas.empty() || faceDatas.back().idxView != idxView)
@@ -742,7 +717,6 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		// }
 
 		#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		// std::cout << "Perform entropy weighting" << std::endl;
 		FOREACH(idxFace, areas) {
 			const uint32_t& area = areas[idxFace];
 			if (area > 0) {
@@ -774,16 +748,15 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			if (pFaceDatas->size() < 20){
 				continue;
 			}
-			std::vector<int> areas_;
-			areas_.clear();
+			std::vector<float> areas_entropy;
+			areas_entropy.clear();
 			for (int i = 0; i < pFaceDatas->size(); i++) {
-				areas_.push_back((*pFaceDatas)[i].area);
-				// areas_.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
-				
+				// areas_.push_back((*pFaceDatas)[i].area);
+				areas_entropy.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
 			}
-			sort(areas_.begin(),areas_.end());
-			int ini_= areas_.size()*0.7;
-			FaceOutlierDetection_area(*pFaceDatas, areas_[ini_]);
+			sort(areas_entropy.begin(),areas_entropy.end());
+			int ini_= areas_entropy.size()*0.7;
+			FaceOutlierDetection_area_entropy(*pFaceDatas, areas_entropy[ini_]);
 		}
 	}
 
@@ -873,11 +846,10 @@ inline T MultiGaussUnnormalized(const Eigen::Matrix<T,N,1>& X, const Eigen::Matr
 	return MultiGaussUnnormalized<T,N>(X - mu, covarianceInv);
 }
 
-bool MeshTexture::FaceOutlierDetection_area(FaceDataArr& faceDatas, int area){
+bool MeshTexture::FaceOutlierDetection_area_entropy(FaceDataArr& faceDatas, float t){
 	BoolArr inliers(faceDatas.GetSize());
 	for (int i = 0; i < faceDatas.size();i++) {
-		if (faceDatas[i].area > area) {
-		// if (faceDatas[i].entropy * faceDatas[i].area > area) {
+		if (faceDatas[i].entropy * faceDatas[i].area > t) {
 			inliers[i] = 1;
 		}
 		else
