@@ -220,7 +220,7 @@ class StepsStore:
              ["scene_dense_mesh.mvs", "--scales", "1", "-w", "%mvs_dir%"]],
             ["Texture the mesh",             # 13
              os.path.join(OPENMVS_BIN, "TextureMesh"),
-             ["scene_dense_mesh.mvs", "--decimate", "0.5", "-w", "%mvs_dir%"]],
+             ["scene_dense_mesh.mvs", "--export-type", "obj", "--decimate", "0.5", "-w", "%mvs_dir%"]],
             ["Estimate disparity-maps",      # 14
              os.path.join(OPENMVS_BIN, "DensifyPointCloud"),
              ["scene.mvs", "--dense-config-file", "Densify.ini", "--fusion-mode", "-1", "-w", "%mvs_dir%"]],
