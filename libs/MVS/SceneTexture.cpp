@@ -61,7 +61,8 @@ using namespace MVS;
 #define TEXOPT_FACEOUTLIER_MEDIAN 1
 #define TEXOPT_FACEOUTLIER_GAUSS_DAMPING 2
 #define TEXOPT_FACEOUTLIER_GAUSS_CLAMPING 3
-#define TEXOPT_FACEOUTLIER TEXOPT_FACEOUTLIER_GAUSS_CLAMPING
+// #define TEXOPT_FACEOUTLIER TEXOPT_FACEOUTLIER_GAUSS_CLAMPING
+#define TEXOPT_FACEOUTLIER TEXOPT_FACEOUTLIER_GAUSS_DAMPING
 
 // method used to find optimal view per face
 #define TEXOPT_INFERENCE_LBP 1
@@ -882,6 +883,7 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 		// if there are not enough points, search in a larger sphere
 		if (point_indices.size() < 2) {
 			// search the nearest points
+			// std::cout << "face" << i << ": " << "Not enough points in the sphere, searching in a larger sphere" << radius * 10 << std::endl;
 			octPoints.Collect(50, point_indices, center, radius * 10);
 			// if there are not enough points, skip this face
 			if (point_indices.size() < 2) {
@@ -912,8 +914,15 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 			return obs1.second > obs2.second;
 		});
 
-		// keep topN views
-		size_t max_views = std::min(view_obs_times_sorted.size(), topN);
+		// keep topN views if views more than 20 / or if there are not enough views, keep all
+		size_t max_views;
+		if (view_obs_times_sorted.size() > topN) {
+			max_views = view_obs_times_sorted.size() * 0.7;
+		}
+		else {
+			max_views = view_obs_times_sorted.size();
+		}
+
 		for (size_t idx_view = 0; idx_view < max_views; idx_view++) {
 			face_obs_views[i].insert(view_obs_times_sorted[idx_view].first);
 		}
@@ -923,6 +932,7 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 
 	// detect outlier views for each face based on point cloud co-visibility, then remove them
 	// views in which the face is not seen by enough points are considered as outliers
+	unsigned long count = 0;
 	FOREACH(idxFace, facesDatas) {
 		FaceDataArr& faceDatas = facesDatas[idxFace];
 		unsigned obsNumber = faceDatas.GetSize();
@@ -940,9 +950,12 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 
 		// remove outliers
 		RFOREACH(i, faceDatas)
-			if (!inliers[i])
+			if (!inliers[i]){
+				count++;
 				faceDatas.RemoveAt(i);
+			}
 	}
+	std::cout << "Removed " << count << " outlier views" << std::endl;
 	return true;
 }
 
