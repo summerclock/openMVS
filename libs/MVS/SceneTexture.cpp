@@ -747,36 +747,52 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	#endif
 	progress.close();
 
-	#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-	if (scene.pointcloud.points.size() > 0) {
-		std::cout << "Performing point cloud co-visibility based face outlier detection" << std::endl;
-		FaceOutlierDetection_CoVis(facesDatas, views, 20, scene.pointcloud.points, scene.pointcloud.pointViews);
+	// remove faces with less than 3 views
+	double total_view_count = 0;
+	FOREACH(idxFace, facesDatas) {
+		FaceDataArr& faceDatas = facesDatas[idxFace];
+		total_view_count += faceDatas.size();
 	}
-	// if (fOutlierThreshold > 0) {
-	// 	// try to detect outlier views for each face
-	// 	// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
-	// 	FOREACHPTR(pFaceDatas, facesDatas)
-	// 		FaceOutlierDetection(*pFaceDatas, fOutlierThreshold);
-	// }
-	#endif
+
+	std::cout << "Total view count: " << total_view_count << std::endl;
+	std::cout << "Average view count per face: " << total_view_count / facesDatas.size() << std::endl;
+
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+	if (scene.pointcloud.points.size() > 0)
+	{
+		std::cout << "Performing point cloud co-visibility based face outlier detection" << std::endl;
+		FaceOutlierDetection_CoVis(facesDatas, views, 5, scene.pointcloud.points, scene.pointcloud.pointViews);
+	}
+#endif
 
 	if (1) {
-		// try to detect outlier views for each face
-		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
-		FOREACHPTR(pFaceDatas, facesDatas)
+			// try to detect outlier views for each face
+			// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
+			FOREACHPTR(pFaceDatas, facesDatas)
+			{
+				if (pFaceDatas->size() < 15){
+					continue;
+				}
+				std::vector<float> areas_entropy;
+				areas_entropy.clear();
+				for (int i = 0; i < pFaceDatas->size(); i++) {
+					// areas_.push_back((*pFaceDatas)[i].area);
+					areas_entropy.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
+				}
+				sort(areas_entropy.begin(),areas_entropy.end());
+				int ini_= areas_entropy.size()*0.7;
+				FaceOutlierDetection_Area_Entropy(*pFaceDatas, areas_entropy[ini_]);
+			}
+		}
+
+	{
+		if (fOutlierThreshold > 0)
 		{
-			if (pFaceDatas->size() < 15){
-				continue;
-			}
-			std::vector<float> areas_entropy;
-			areas_entropy.clear();
-			for (int i = 0; i < pFaceDatas->size(); i++) {
-				// areas_.push_back((*pFaceDatas)[i].area);
-				areas_entropy.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
-			}
-			sort(areas_entropy.begin(),areas_entropy.end());
-			int ini_= areas_entropy.size()*0.7;
-			FaceOutlierDetection_Area_Entropy(*pFaceDatas, areas_entropy[ini_]);
+			std::cout << "Performing color based face outlier detection" << std::endl;
+			// try to detect outlier views for each face
+			// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
+			FOREACHPTR(pFaceDatas, facesDatas)
+			FaceOutlierDetection(*pFaceDatas, fOutlierThreshold);
 		}
 	}
 
@@ -865,6 +881,7 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 
 	// find views seeing face
 	std::unordered_map<unsigned, std::unordered_set<unsigned>> face_obs_views;
+	unsigned long total_view_count = 0;
 	FOREACH(i, faces) {
 		const Face& face = faces[i];
 		PointCloud::Point pts[3];
@@ -874,7 +891,7 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 
 		// search in a small sphere first
 		PointCloud::Point center = (pts[0] + pts[1] + pts[2]) / 3;
-		float radius = std::max(std::max(cv::norm(pts[0] - center), cv::norm(pts[1] - center)), cv::norm(pts[2] - center));
+		float radius = std::max(std::max(cv::norm(pts[0] - center), cv::norm(pts[1] - center)), cv::norm(pts[2] - center)) * 1.5;
 
 		// search dense points in this sphere
 		MVS::PointCloud::Octree::IDXARR_TYPE point_indices;
@@ -926,7 +943,11 @@ bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const 
 		for (size_t idx_view = 0; idx_view < max_views; idx_view++) {
 			face_obs_views[i].insert(view_obs_times_sorted[idx_view].first);
 		}
+		total_view_count += view_obs_times_sorted.size();
 	}
+
+	std::cout << "(pointcloud) Total view count: " << total_view_count << std::endl;
+	std::cout << "(pointcloud) Average view count per face: " << double(total_view_count) / faces.size() << std::endl;
 
 	std::cout << "Removing outlier views" << std::endl;
 
