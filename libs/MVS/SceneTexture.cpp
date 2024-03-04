@@ -62,6 +62,7 @@ using namespace MVS;
 #define TEXOPT_FACEOUTLIER_GAUSS_DAMPING 2
 #define TEXOPT_FACEOUTLIER_GAUSS_CLAMPING 3
 #define TEXOPT_FACEOUTLIER TEXOPT_FACEOUTLIER_GAUSS_CLAMPING
+// #define TEXOPT_FACEOUTLIER TEXOPT_FACEOUTLIER_GAUSS_DAMPING
 
 // method used to find optimal view per face
 #define TEXOPT_INFERENCE_LBP 1
@@ -448,14 +449,16 @@ public:
 
 	void ListVertexFaces();
 
-	bool ListCameraFaces(FaceDataViewArr&, float fOutlierThreshold);
+	bool ListCameraFaces(FaceDataViewArr&, float fOutlierThreshold, const IIndexArr& _views);
 
 	#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	bool FaceOutlierDetection(FaceDataArr& faceDatas, float fOutlierThreshold) const;
-	bool FaceOutlierDetection_area_entropy(FaceDataArr& faceDatas, float t);
+	bool FaceOutlierDetection_Area(FaceDataArr& faceDatas, float t);
+	bool FaceOutlierDetection_Entropy(FaceDataArr& faceDatas, float t);
+	bool FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const IIndexArr& views, size_t topN, const PointCloud::PointArr& points, const PointCloud::PointViewArr& pointViews) const;
 	#endif
 
-	bool FaceViewSelection(float fOutlierThreshold, float fRatioDataSmoothness);
+	bool FaceViewSelection(float fOutlierThreshold, float fRatioDataSmoothness, const IIndexArr& views);
 
 	void CreateSeamVertices();
 	void GlobalSeamLeveling();
@@ -549,7 +552,7 @@ void MeshTexture::ListVertexFaces()
 }
 
 // extract array of faces viewed by each image
-bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThreshold)
+bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThreshold, const IIndexArr& _views)
 {
 	// create vertices octree
 	facesDatas.Resize(faces.GetSize());
@@ -578,10 +581,15 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	#endif
 
 	// compute normals
-	scene.mesh.ComputeNormalFaces();
+	// scene.mesh.ComputeNormalFaces();
+	IIndexArr views(_views);
+	if (views.empty()) {
+		views.resize(images.size());
+		std::iota(views.begin(), views.end(), IIndex(0));
+	}
 
 	// extract array of faces viewed by each image
-	Util::Progress progress(_T("Initialized views"), images.GetSize());
+	Util::Progress progress(_T("Initialized views"), views.size());
 	typedef float real;
 	TImage<real> imageGradMag;
 	TImage<real> imageGray;
@@ -591,13 +599,13 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	#ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
 	#pragma omp parallel for private(imageGradMag,  imageGray, mGrad, faceMap, depthMap)
-	for (int_t idx=0; idx<(int_t)images.GetSize(); ++idx) {
+	for (int_t idx=0; idx<(int_t)views.size(); ++idx) {
 		#pragma omp flush (bAbort)
 		if (bAbort) {
 			++progress;
 			continue;
 		}
-		const uint32_t idxView((uint32_t)idx);
+		const uint32_t idxView(views[(IIndex)idx]);
 	#else
 	FOREACH(idxView, images) {
 	#endif
@@ -640,6 +648,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
 		#endif
 		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2()+mGrad[1].cwiseAbs2()).cwiseSqrt();
+		cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(15, 15), 0, 0, cv::BORDER_DEFAULT);
 		(TImage<real>::EMatMap)imageGray = imageGray;
 		// select faces inside view frustum
 		CameraFaces cameraFaces;
@@ -725,7 +734,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 				facesDatas[idxFace].Last().area = area;
 				float entropy = entropy_hist(facesDatas[idxFace].Last().hist, facesDatas[idxFace].Last().count);
 				std::vector<float>().swap(facesDatas[idxFace].Last().hist);
-				// facesDatas[idxFace].Last().quality *= entropy;
+				facesDatas[idxFace].Last().quality = entropy;
 				// facesDatas[idxFace].Last().quality *= area;
 				facesDatas[idxFace].Last().entropy = entropy;
 			}
@@ -740,23 +749,50 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	#endif
 	progress.close();
 
+	double total_view_count = 0;
+	FOREACH(idxFace, facesDatas) {
+		FaceDataArr& faceDatas = facesDatas[idxFace];
+		total_view_count += faceDatas.size();
+	}
+
+	std::cout << "Total view count: " << total_view_count << std::endl;
+	std::cout << "Average view count per face: " << total_view_count / facesDatas.size() << std::endl;
+
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+	if (scene.pointcloud.points.size() > 0)
+	{
+		std::cout << "Performing point cloud co-visibility based face outlier detection" << std::endl;
+		FaceOutlierDetection_CoVis(facesDatas, views, 5, scene.pointcloud.points, scene.pointcloud.pointViews);
+	}
+#endif
+
 	if (1) {
 		// try to detect outlier views for each face
 		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
+		float ratio_a = 0.7;
+		float ratio_e = 0.3;
+		std::cout << "Perform area based face outlier clamping: ratio " << ratio_a << std::endl;
+		std::cout << "Perform entropy based face outlier clamping: ratio " << ratio_e << std::endl;
 		FOREACHPTR(pFaceDatas, facesDatas)
 		{
 			if (pFaceDatas->size() < 20){
 				continue;
 			}
-			std::vector<float> areas_entropy;
-			areas_entropy.clear();
+			std::vector<float> areas;
+			areas.clear();
+			std::vector<float> entropy;
+			entropy.clear();
 			for (int i = 0; i < pFaceDatas->size(); i++) {
-				// areas_.push_back((*pFaceDatas)[i].area);
-				areas_entropy.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
+				areas.push_back((*pFaceDatas)[i].area);
+				entropy.push_back((*pFaceDatas)[i].entropy);
+				// areas_entropy.push_back((*pFaceDatas)[i].entropy * (*pFaceDatas)[i].area);
 			}
-			sort(areas_entropy.begin(),areas_entropy.end());
-			int ini_= areas_entropy.size()*0.7;
-			FaceOutlierDetection_area_entropy(*pFaceDatas, areas_entropy[ini_]);
+			sort(areas.begin(),areas.end());
+			sort(entropy.begin(),entropy.end());
+			float ini_a= areas.size() * ratio_a;
+			FaceOutlierDetection_Area(*pFaceDatas, areas[ini_a]);
+			float ini_e = entropy.size() * ratio_e;
+			FaceOutlierDetection_Entropy(*pFaceDatas, entropy[ini_e]);
 		}
 	}
 
@@ -765,10 +801,16 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	if (fOutlierThreshold > 0) {
 		// try to detect outlier views for each face
 		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
+		#if TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_CLAMPING
+			std::cout << "Perform color based face outlier clamping: t " << fOutlierThreshold << std::endl;
+		#elif TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_DAMPING
+			std::cout << "Perform color based face outlier damping: t " << fOutlierThreshold << std::endl;
+		#endif
 		FOREACHPTR(pFaceDatas, facesDatas)
 			FaceOutlierDetection(*pFaceDatas, fOutlierThreshold);
 	}
 	#endif
+
 	return true;
 }
 
@@ -846,10 +888,118 @@ inline T MultiGaussUnnormalized(const Eigen::Matrix<T,N,1>& X, const Eigen::Matr
 	return MultiGaussUnnormalized<T,N>(X - mu, covarianceInv);
 }
 
-bool MeshTexture::FaceOutlierDetection_area_entropy(FaceDataArr& faceDatas, float t){
+bool MeshTexture::FaceOutlierDetection_CoVis(FaceDataViewArr& facesDatas, const IIndexArr& views, size_t topN, const PointCloud::PointArr& points, const PointCloud::PointViewArr& pointViews) const {
+	std::unordered_set<unsigned> valid_views(views.begin(), views.end());
+
+	// construct octree for point cloud
+	MVS::PointCloud::Octree octPoints(points);
+
+	// find views seeing face
+	std::unordered_map<unsigned, std::unordered_set<unsigned>> face_obs_views;
+	unsigned long total_view_count = 0;
+	FOREACH(i, faces) {
+		const Face& face = faces[i];
+		PointCloud::Point pts[3];
+		for (int v=0; v<3; ++v) {
+			pts[v] = vertices[face[v]];
+		}
+
+		// search in a small sphere first
+		PointCloud::Point center = (pts[0] + pts[1] + pts[2]) / 3;
+		float radius = std::max(std::max(cv::norm(pts[0] - center), cv::norm(pts[1] - center)), cv::norm(pts[2] - center)) * 1.5;
+
+		// search dense points in this sphere
+		MVS::PointCloud::Octree::IDXARR_TYPE point_indices;
+		octPoints.Collect(point_indices, center, radius);
+
+		// if there are not enough points, search in a larger sphere
+		if (point_indices.size() < 2) {
+			// search the nearest points
+			// std::cout << "face" << i << ": " << "Not enough points in the sphere, searching in a larger sphere" << radius * 10 << std::endl;
+			octPoints.Collect(50, point_indices, center, radius * 10);
+			// if there are not enough points, skip this face
+			if (point_indices.size() < 2) {
+				continue;
+			}
+		}
+		
+		// collect views seeing these points，count the number of points seen by each view
+		std::unordered_map<int, int> view_obs_times;
+		for (const auto& point_idx : point_indices) {
+			// pointViews: for each point, the list of views seeing it
+			const auto& view_indices = pointViews[point_idx];
+			for (const auto& view_idx : view_indices) {
+				++view_obs_times[view_idx];
+			}
+		}
+
+		// prepare for sorting
+		std::vector<std::pair<int, int>> view_obs_times_sorted;
+		for (const auto& pair : view_obs_times) {
+			if(valid_views.count(pair.first)) {
+				view_obs_times_sorted.emplace_back(pair.first, pair.second);
+			}
+		}
+
+		// sort by the number of points seen by each view
+		std::sort(view_obs_times_sorted.begin(), view_obs_times_sorted.end(), [](const std::pair<int, int>& obs1, const std::pair<int, int>& obs2) {
+			return obs1.second > obs2.second;
+		});
+
+		// keep topN views if views more than 20 / or if there are not enough views, keep all
+		size_t max_views;
+		if (view_obs_times_sorted.size() > topN) {
+			max_views = view_obs_times_sorted.size() * 0.7;
+		}
+		else {
+			max_views = view_obs_times_sorted.size();
+		}
+
+		for (size_t idx_view = 0; idx_view < max_views; idx_view++) {
+			face_obs_views[i].insert(view_obs_times_sorted[idx_view].first);
+		}
+		total_view_count += view_obs_times_sorted.size();
+	}
+
+	std::cout << "(pointcloud) Total view count: " << total_view_count << std::endl;
+	std::cout << "(pointcloud) Average view count per face: " << double(total_view_count) / faces.size() << std::endl;
+
+	std::cout << "Removing outlier views" << std::endl;
+
+	// detect outlier views for each face based on point cloud co-visibility, then remove them
+	// views in which the face is not seen by enough points are considered as outliers
+	unsigned long count = 0;
+	FOREACH(idxFace, facesDatas) {
+		FaceDataArr& faceDatas = facesDatas[idxFace];
+		unsigned obsNumber = faceDatas.GetSize();
+
+		if (!face_obs_views.count(idxFace)) {
+			continue;
+		}
+		const auto& inlier_views = face_obs_views.at(idxFace);
+		std::vector<bool> inliers(obsNumber, true);
+		FOREACH(i, faceDatas) {
+			if (!inlier_views.count(faceDatas[i].idxView)) {
+				inliers[i] = false;
+			}
+		}
+
+		// remove outliers
+		RFOREACH(i, faceDatas)
+			if (!inliers[i]){
+				count++;
+				faceDatas.RemoveAt(i);
+			}
+	}
+	std::cout << "Removed " << count << " outlier views" << std::endl;
+	return true;
+}
+
+bool MeshTexture::FaceOutlierDetection_Area(FaceDataArr& faceDatas, float t){
 	BoolArr inliers(faceDatas.GetSize());
 	for (int i = 0; i < faceDatas.size();i++) {
-		if (faceDatas[i].entropy * faceDatas[i].area > t) {
+		// if (faceDatas[i].entropy * faceDatas[i].area > t) {
+		if (faceDatas[i].area > t) {
 			inliers[i] = 1;
 		}
 		else
@@ -861,7 +1011,24 @@ bool MeshTexture::FaceOutlierDetection_area_entropy(FaceDataArr& faceDatas, floa
 		if (!inliers[i])
 			faceDatas.RemoveAt(i);
 	return 1;
+}
 
+bool MeshTexture::FaceOutlierDetection_Entropy(FaceDataArr& faceDatas, float t){
+	BoolArr inliers(faceDatas.GetSize());
+	for (int i = 0; i < faceDatas.size();i++) {
+		// if (faceDatas[i].entropy * faceDatas[i].area > t) {
+		if (faceDatas[i].entropy >= t) {
+			inliers[i] = 1;
+		}
+		else
+		{
+			inliers[i] = 0;
+		}
+	}
+	RFOREACH(i, faceDatas)
+		if (!inliers[i])
+			faceDatas.RemoveAt(i);
+	return 1;
 }
 
 // decrease the quality of / remove all views in which the face's projection
@@ -968,7 +1135,7 @@ bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) 
 }
 #endif
 
-bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmoothness)
+bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmoothness, const IIndexArr& views)
 {
 	// extract array of triangles incident to each vertex
 	ListVertexFaces();
@@ -977,7 +1144,7 @@ bool MeshTexture::FaceViewSelection(float fOutlierThreshold, float fRatioDataSmo
 	{
 		// list all views for each face
 		FaceDataViewArr facesDatas;
-		if (!ListCameraFaces(facesDatas, fOutlierThreshold))
+		if (!ListCameraFaces(facesDatas, fOutlierThreshold, views))
 			return false;
 
 		// create faces graph
@@ -2339,14 +2506,14 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 }
 
 // texture mesh
-bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, float fOutlierThreshold, float fRatioDataSmoothness, bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float colorDissimilarityThreshold)
+bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, float fOutlierThreshold, float fRatioDataSmoothness, bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float colorDissimilarityThreshold, const IIndexArr& views)
 {
 	MeshTexture texture(*this, nResolutionLevel, nMinResolution, colorDissimilarityThreshold);
 
 	// assign the best view to each face
 	{
 		TD_TIMER_STARTD();
-		if (!texture.FaceViewSelection(fOutlierThreshold, fRatioDataSmoothness))
+		if (!texture.FaceViewSelection(fOutlierThreshold, fRatioDataSmoothness, views))
 			return false;
 		DEBUG_EXTRA("Assigning the best view to each face completed: %u faces (%s)", mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}

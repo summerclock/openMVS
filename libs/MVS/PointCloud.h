@@ -70,6 +70,8 @@ public:
 
 	typedef AABB3f Box;
 
+	typedef TOctree<PointArr,Point::Type,3> Octree;
+
 public:
 	PointArr points;
 	PointViewArr pointViews; // array of views for each point (ordered increasing)
