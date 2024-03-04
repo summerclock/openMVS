@@ -58,6 +58,7 @@ SET(OpenMVS_USE_BREAKPAD ON CACHE BOOL "Enable BreakPad library")
 SET(OpenMVS_CONFIG_INCLUDE_DIR "${CMAKE_BINARY_DIR}/" CACHE PATH "Where to create the build/platform specific header")
 
 INCLUDE_DIRECTORIES("${OpenMVS_SOURCE_DIR}")
+INCLUDE_DIRECTORIES("${OpenMVS_SOURCE_DIR}/mapmap_cpu")
 
 # Find required packages
 SET(OpenMVS_EXTRA_LIBS "")

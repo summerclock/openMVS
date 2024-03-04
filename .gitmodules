@@ -1,0 +1,3 @@
+[submodule "mapmap_cpu"]
+	path = mapmap_cpu
+	url = ../mapmap_cpu.git
